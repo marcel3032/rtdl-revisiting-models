@@ -7,28 +7,32 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils import prune
+from torch.utils.tensorboard import SummaryWriter
 import zero
 from torch import Tensor
 
 import lib
 
+writer = SummaryWriter()
+
 
 # %%
 class ResNet(nn.Module):
     def __init__(
-        self,
-        *,
-        d_numerical: int,
-        categories: ty.Optional[ty.List[int]],
-        d_embedding: int,
-        d: int,
-        d_hidden_factor: float,
-        n_layers: int,
-        activation: str,
-        normalization: str,
-        hidden_dropout: float,
-        residual_dropout: float,
-        d_out: int,
+            self,
+            *,
+            d_numerical: int,
+            categories: ty.Optional[ty.List[int]],
+            d_embedding: int,
+            d: int,
+            d_hidden_factor: float,
+            n_layers: int,
+            activation: str,
+            normalization: str,
+            hidden_dropout: float,
+            residual_dropout: float,
+            d_out: int,
     ) -> None:
         super().__init__()
 
@@ -166,6 +170,16 @@ if __name__ == "__main__":
         d_out=D.info['n_classes'] if D.is_multiclass else 1,
         **args['model'],
     ).to(device)
+
+
+    def init_weights(m):
+        if hasattr(m, "weight") and "Linear" in m.__class__.__name__:
+            # print(m.__class__.__name__)
+            # print(m.weight)
+            prune.random_unstructured(m, 'weight', amount=0.4)
+
+    model.apply(init_weights)
+
     stats['n_parameters'] = lib.get_n_parameters(model)
     optimizer = lib.make_optimizer(
         args['training']['optimizer'],
@@ -179,6 +193,7 @@ if __name__ == "__main__":
     training_log = {lib.TRAIN: [], lib.VAL: [], lib.TEST: []}
     timer = zero.Timer()
     checkpoint_path = output / 'checkpoint.pt'
+
 
     def print_epoch_info():
         print(f'\n>>> Epoch {stream.epoch} | {lib.format_seconds(timer())} | {output}')
@@ -194,6 +209,7 @@ if __name__ == "__main__":
             )
         )
 
+
     @torch.no_grad()
     def evaluate(parts):
         model.eval()
@@ -208,11 +224,11 @@ if __name__ == "__main__":
                             None if X_cat is None else X_cat[part][idx],
                         )
                         for idx in lib.IndexLoader(
-                            D.size(part),
-                            args['training']['eval_batch_size'],
-                            False,
-                            device,
-                        )
+                        D.size(part),
+                        args['training']['eval_batch_size'],
+                        False,
+                        device,
+                    )
                     ]
                 )
                 .cpu()
@@ -228,6 +244,7 @@ if __name__ == "__main__":
         for part, part_metrics in metrics.items():
             print(f'[{part:<5}]', lib.make_summary(part_metrics))
         return metrics, predictions
+
 
     def save_checkpoint(final):
         torch.save(
@@ -251,6 +268,7 @@ if __name__ == "__main__":
         lib.dump_stats(stats, output, final)
         lib.backup_output(output)
 
+
     # %%
     timer.run()
     for epoch in stream.epochs(args['training']['n_epochs']):
@@ -270,14 +288,21 @@ if __name__ == "__main__":
             loss.backward()
             optimizer.step()
             epoch_losses.append(loss.detach())
+            writer.add_scalar("loss by minibatch", epoch_losses[-1], stream.iteration)
         epoch_losses = torch.stack(epoch_losses).tolist()
         training_log[lib.TRAIN].extend(epoch_losses)
+        writer.add_scalar("loss by epoch", sum(epoch_losses) / len(epoch_losses), stream.epoch)
         print(f'[{lib.TRAIN}] loss = {round(sum(epoch_losses) / len(epoch_losses), 3)}')
 
         metrics, predictions = evaluate([lib.VAL, lib.TEST])
+        # print(metrics["val"]["score"], metrics["test"]["score"])
+        writer.add_scalar("val score by epoch", metrics["val"]["score"], stream.epoch)
+        writer.add_scalar("test score by epoch", metrics["test"]["score"], stream.epoch)
         for k, v in metrics.items():
             training_log[k].append(v)
         progress.update(metrics[lib.VAL]['score'])
+
+        writer.flush()
 
         if progress.success:
             print('New best epoch!')
