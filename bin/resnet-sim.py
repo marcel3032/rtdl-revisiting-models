@@ -76,7 +76,7 @@ class ResNet(nn.Module):
         self.last_normalization = make_normalization()
         self.head = nn.Linear(d, d_out)
 
-        self.K = 0.01
+        self.K = 0.05
         self.update_method = 'random'
         self.k_similar = 0.1
         self.bits = 1.5
@@ -133,6 +133,7 @@ def remove_smallest_weights(layer, K):
     indices = np.unravel_index(np.argpartition(weights, K)[:K], layer.weight.shape)
     layer.weight[indices] = 0
     layer.weight_mask[indices] = 0
+    # print("   remove:", indices[0].shape)
 
 
 def weight_magic_random(conv, K, k_similar):
@@ -146,6 +147,7 @@ def weight_magic_random(conv, K, k_similar):
     p = torch.ones(indices.shape[0], device=device)
     to_randn = tuple(indices[p.multinomial(K, False)].T)
 
+    # print("   add: ", to_randn[0].shape)
     conv.weight[to_randn] = 0
     conv.weight_mask[to_randn] = 1
 
@@ -192,6 +194,7 @@ def weight_magic_faiss(layer, K, k_similar, bits):
     to_randn = idx.T
 
     # print(to_randn, to_randn.shape)
+    # print("   add: ", to_randn.shape)
     layer.weight[to_randn[0], to_randn[1]] = 0
     layer.weight_mask[to_randn[0], to_randn[1]] = 1
 
