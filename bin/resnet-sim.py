@@ -3,6 +3,7 @@ import math
 import typing as ty
 from pathlib import Path
 
+import faiss
 import numpy as np
 import torch
 import torch.nn as nn
@@ -75,6 +76,12 @@ class ResNet(nn.Module):
         self.last_normalization = make_normalization()
         self.head = nn.Linear(d, d_out)
 
+        self.K = 0.01
+        self.update_method = 'random'
+        self.k_similar = 0.1
+        self.bits = 1.5
+        self.sparsity = 0.9
+
     def forward(self, x_num: Tensor, x_cat: ty.Optional[Tensor]) -> Tensor:
         x = []
         if x_num is not None:
@@ -106,10 +113,110 @@ class ResNet(nn.Module):
         x = x.squeeze(-1)
         return x
 
+    def update_weights_in_module(self, m):
+        if "Linear" in m.__class__.__name__:
+            remove_smallest_weights(m, self.K)
+            if self.update_method == 'faiss':
+                weight_magic_faiss(m, self.K, self.k_similar, self.bits)
+            elif self.update_method == 'random':
+                weight_magic_random(m, self.K, self.k_similar)
+            elif self.update_method == 'bruteforce':
+                weight_magic(m, self.K, self.k_similar)
+            else:
+                raise RuntimeError(f"unknown update method: {self.update_method}")
+
+
+def remove_smallest_weights(layer, K):
+    K = int(layer.weight.numel() * K)
+    weights = np.abs(layer.weight.detach().cpu().numpy().reshape(-1))
+    weights[layer.weight_mask.detach().cpu().numpy().reshape(-1) == 0] = np.inf
+    indices = np.unravel_index(np.argpartition(weights, K)[:K], layer.weight.shape)
+    layer.weight[indices] = 0
+    layer.weight_mask[indices] = 0
+
+
+def weight_magic_random(conv, K, k_similar):
+    # print("random")
+    delattr(conv, "input")
+    delattr(conv, "grad_output")
+
+    K = int(conv.weight.numel() * K)
+
+    indices = torch.nonzero(torch.where(conv.weight_mask == 0, 1, 0))
+    p = torch.ones(indices.shape[0], device=device)
+    to_randn = tuple(indices[p.multinomial(K, False)].T)
+
+    conv.weight[to_randn] = 0
+    conv.weight_mask[to_randn] = 1
+
+
+def weight_magic_faiss(layer, K, k_similar, bits):
+    # print("faiss")
+    x = layer.input
+    batch_size = x.shape[0]
+    out = layer.grad_output
+
+    # print(layer.weight.shape)
+    # print(x.shape, out.shape)
+
+    delattr(layer, "input")
+    delattr(layer, "grad_output")
+
+    K = int(layer.weight.numel() * K)
+
+    x = x.detach().cpu().numpy().T
+    out = out.detach().cpu().numpy().T
+
+    index = faiss.IndexFlatIP(batch_size)  # , int(bits * batch_size)
+    index.train(x)
+    index.add(x)
+
+    k_similar = int(x.shape[0] * 1)
+
+    D, I = index.search(out, k_similar)
+    D = D.reshape(-1)
+    D = np.abs(D)
+
+    # print(D, D.shape)
+    # print(I, I.shape)
+
+    idx = np.array(
+        (np.repeat(np.arange(layer.weight.shape[0]), k_similar).reshape(layer.weight.shape[0], k_similar),
+         *np.unravel_index(I, layer.weight.shape[1]))).reshape(2, -1)
+    # print(idx, idx.shape)
+
+    D[layer.weight_mask[idx[0], idx[1]].detach().cpu().numpy() == 1] = np.inf
+
+    # print(D.shape, idx.shape, K, layer.weight.numel(), out.shape, x.shape)
+    idx = idx.T[np.argpartition(D, -K)[-K:]]
+    to_randn = idx.T
+
+    # print(to_randn, to_randn.shape)
+    layer.weight[to_randn[0], to_randn[1]] = 0
+    layer.weight_mask[to_randn[0], to_randn[1]] = 1
+
 
 # %%
 if __name__ == "__main__":
     args, output = lib.load_config()
+
+
+    def _backward_hook(module, grad_input, grad_output):  # module, grad_input, grad_output
+        with torch.no_grad():
+            if not hasattr(module, "grad_output"):
+                module.grad_output = torch.zeros([args['training']['batch_size']] + list(grad_output[0].shape)[1:],
+                                                 device=device)
+            if module.grad_output.shape[0] == grad_output[0].shape[0]:
+                module.grad_output += grad_output[0]
+
+
+    def _forward_hook(module, input, output):
+        with torch.no_grad():
+            if not hasattr(module, "input"):
+                module.input = torch.zeros([args['training']['batch_size']] + list(input[0].shape)[1:], device=device)
+            if module.input.shape[0] == input[0].shape[0]:
+                module.input += input[0]
+
 
     # %%
     zero.set_randomness(args['seed'])
@@ -176,7 +283,10 @@ if __name__ == "__main__":
         if hasattr(m, "weight") and "Linear" in m.__class__.__name__:
             # print(m.__class__.__name__)
             # print(m.weight)
-            prune.random_unstructured(m, 'weight', amount=0.9)
+            prune.random_unstructured(m, 'weight', amount=model.sparsity)
+            m.register_forward_hook(_forward_hook)
+            m.register_backward_hook(_backward_hook)
+
 
     model.apply(init_weights)
 
@@ -290,6 +400,9 @@ if __name__ == "__main__":
             epoch_losses.append(loss.detach())
             writer.add_scalar("loss by minibatch", epoch_losses[-1], stream.iteration)
 
+            if stream.iteration % 20 == 0:
+                model.apply(model.update_weights_in_module)
+
         epoch_losses = torch.stack(epoch_losses).tolist()
         training_log[lib.TRAIN].extend(epoch_losses)
         writer.add_scalar("loss by epoch", sum(epoch_losses) / len(epoch_losses), stream.epoch)
@@ -300,8 +413,10 @@ if __name__ == "__main__":
         def log_sparsity(m):
             print(m.__class__.__name__)
             if hasattr(m, "weight"):
-                print("   ", m.__class__.__name__, torch.count_nonzero(m.weight.detach().cpu()) / torch.numel(m.weight.detach().cpu()))
+                print("   ", m.__class__.__name__,
+                      torch.count_nonzero(m.weight.detach().cpu()) / torch.numel(m.weight.detach().cpu()))
                 # print(m.weight)
+
 
         # model.apply(log_sparsity)
 
